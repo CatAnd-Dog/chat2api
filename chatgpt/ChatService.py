@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import random
 import uuid
@@ -13,6 +14,7 @@ from chatgpt.chatFormat import api_messages_to_chat, stream_response, format_not
 from chatgpt.chatLimit import check_is_limit, handle_request_limit
 from chatgpt.fp import get_fp
 from chatgpt.proofofWork import get_config, get_dpl, get_answer_token, get_requirements_token
+from chatgpt.stream_v1 import transform_delta_stream
 
 from utils.Client import Client
 from utils.Logger import logger
@@ -86,9 +88,12 @@ class ChatService:
         self.host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
         self.ark0se_token_url = random.choice(ark0se_token_url_list) if ark0se_token_url_list else None
 
-        self.s = Client(proxy=self.proxy_url, impersonate=self.impersonate)
+        session_id = hashlib.md5(self.req_token.encode()).hexdigest()
+        proxy_url = self.proxy_url.replace("{}", session_id) if self.proxy_url else None
+        self.s = Client(proxy=proxy_url, impersonate=self.impersonate)
         if sentinel_proxy_url_list:
-            self.ss = Client(proxy=random.choice(sentinel_proxy_url_list), impersonate=self.impersonate)
+            sentinel_proxy_url = (random.choice(sentinel_proxy_url_list)).replace("{}", session_id) if sentinel_proxy_url_list else None
+            self.ss = Client(proxy=sentinel_proxy_url, impersonate=self.impersonate)
         else:
             self.ss = self.s
 
@@ -100,12 +105,11 @@ class ChatService:
         self.chat_headers = None
         self.chat_request = None
 
-        self.base_headers = {
+        self.origin_base_headers = {
             'accept': '*/*',
             'accept-encoding': 'gzip, deflate, br, zstd',
             'accept-language': 'en-US,en;q=0.9',
             'content-type': 'application/json',
-            'oai-language': oai_language,
             'origin': self.host_url,
             'priority': 'u=1, i',
             'referer': f'{self.host_url}/',
@@ -113,7 +117,10 @@ class ChatService:
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin'
         }
+
+        self.base_headers = self.origin_base_headers.copy()
         self.base_headers.update(self.fp)
+        self.base_headers['oai-language'] = oai_language
 
         if self.access_token:
             self.base_url = self.host_url + "/backend-api"
@@ -136,7 +143,17 @@ class ChatService:
         else:
             self.gizmo_id = None
 
-        if "o1-preview" in self.origin_model:
+        if "o3-mini-high" in self.origin_model:
+            self.req_model = "o3-mini-high"
+        elif "o3-mini-medium" in self.origin_model:
+            self.req_model = "o3-mini-medium"
+        elif "o3-mini-low" in self.origin_model:
+            self.req_model = "o3-mini-low"
+        elif "o3-mini" in self.origin_model:
+            self.req_model = "o3-mini"
+        elif "o3" in self.origin_model:
+            self.req_model = "o3"
+        elif "o1-preview" in self.origin_model:
             self.req_model = "o1-preview"
         elif "o1-pro" in self.origin_model:
             self.req_model = "o1-pro"
@@ -169,7 +186,7 @@ class ChatService:
         url = f'{self.base_url}/sentinel/chat-requirements'
         headers = self.base_headers.copy()
         try:
-            config = get_config(self.user_agent)
+            config = get_config(self.user_agent, self.req_token)
             p = get_requirements_token(config)
             data = {'p': p}
             r = await self.ss.post(url, headers=headers, json=data, timeout=5)
@@ -197,7 +214,7 @@ class ChatService:
                     try:
                         if turnstile_solver_url:
                             res = await self.s.post(
-                                turnstile_solver_url, json={"url": "https://chatgpt.com", "p": p, "dx": turnstile_dx}
+                                turnstile_solver_url, json={"url": "https://chatgpt.com", "p": p, "dx": turnstile_dx, "ua": self.user_agent}
                             )
                             self.turnstile_token = res.json().get("t")
                     except Exception as e:
@@ -317,16 +334,18 @@ class ChatService:
             "model": self.req_model,
             "paragen_cot_summary_display_override": "allow",
             "paragen_stream_type_override": None,
-            "parent_message_id": self.parent_message_id if self.parent_message_id else f"{uuid.uuid4()}",
+            "parent_message_id": self.parent_message_id if self.parent_message_id else f"client-created-root",
             "reset_rate_limits": False,
             "suggestions": [],
-            "supported_encodings": [],
+            "supported_encodings": ["v1"],
             "system_hints": [],
             "timezone": "America/Los_Angeles",
             "timezone_offset_min": -480,
             "variant_purpose": "comparison_implicit",
             "websocket_request_id": f"{uuid.uuid4()}",
         }
+        if "image" in self.origin_model or "image" in self.req_model:
+            self.chat_request["system_hints"].append("picture_v2")
         if self.conversation_id:
             self.chat_request['conversation_id'] = self.conversation_id
         return self.chat_request
@@ -355,7 +374,8 @@ class ChatService:
 
             content_type = r.headers.get("Content-Type", "")
             if "text/event-stream" in content_type:
-                res, start = await head_process_response(r.aiter_lines())
+                complete_stream_data = transform_delta_stream(r.aiter_lines())
+                res, start = await head_process_response(complete_stream_data)
                 if not start:
                     raise HTTPException(
                         status_code=403,
@@ -386,7 +406,21 @@ class ChatService:
         url = f"{self.base_url}/files/{file_id}/download"
         headers = self.base_headers.copy()
         try:
-            r = await self.s.get(url, headers=headers, timeout=10)
+            r = await self.s.get(url, headers=headers, timeout=30)
+            if r.status_code == 200:
+                download_url = r.json().get('download_url')
+                return download_url
+            else:
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+        except Exception as e:
+            logger.error(f"Failed to get download url: {e}")
+            return ""
+
+    async def get_attachment_url(self, file_id, conversation_id):
+        url = f"{self.base_url}/conversation/{conversation_id}/attachment/{file_id}/download"
+        headers = self.base_headers.copy()
+        try:
+            r = await self.s.get(url, headers=headers, timeout=30)
             if r.status_code == 200:
                 download_url = r.json().get('download_url')
                 return download_url
@@ -400,7 +434,7 @@ class ChatService:
         url = f"{self.base_url}/files/{file_id}/uploaded"
         headers = self.base_headers.copy()
         try:
-            r = await self.s.post(url, headers=headers, json={}, timeout=10)
+            r = await self.s.post(url, headers=headers, json={}, timeout=30)
             if r.status_code == 200:
                 download_url = r.json().get('download_url')
                 return download_url
@@ -418,7 +452,7 @@ class ChatService:
                 url,
                 headers=headers,
                 json={"file_name": file_name, "file_size": file_size, "reset_rate_limits": False, "timezone_offset_min": -480, "use_case": use_case},
-                timeout=5,
+                timeout=30,
             )
             if r.status_code == 200:
                 res = r.json()
@@ -433,26 +467,25 @@ class ChatService:
             return "", ""
 
     async def upload(self, upload_url, file_content, mime_type):
-        headers = self.base_headers.copy()
-        headers.update(
-            {
-                'accept': 'application/json, text/plain, */*',
-                'content-type': mime_type,
-                'x-ms-blob-type': 'BlockBlob',
-                'x-ms-version': '2020-04-08',
-            }
-        )
-        headers.pop('authorization', None)
-        headers.pop('oai-device-id', None)
-        headers.pop('oai-language', None)
-        try:
-            r = await self.s.put(upload_url, headers=headers, data=file_content, timeout=60)
-            if r.status_code == 201:
-                return True
-            else:
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-        except Exception as e:
-            logger.error(f"Failed to upload file: {e}")
+        for i in range(3):
+            try:
+                headers = self.origin_base_headers.copy()
+                headers.update({
+                    'accept': 'application/json, text/plain, */*',
+                    'content-type': mime_type,
+                    'x-ms-blob-type': 'BlockBlob',
+                    'x-ms-version': '2020-04-08',
+                })
+                r = await self.s.put(upload_url, headers=headers, data=file_content, timeout=120)
+                if r.status_code == 201:
+                    return True
+                else:
+                    raise HTTPException(status_code=r.status_code, detail=r.text)
+            except Exception as e:
+                logger.error(f"Failed to upload file: {e}")
+                await asyncio.sleep(1)
+        else:
+            logger.error(f"Failed to upload file after 3 attempts")
             return False
 
     async def upload_file(self, file_content, mime_type):

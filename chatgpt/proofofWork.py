@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 
 import pybase64
+import diskcache as dc
 
 from utils.Logger import logger
 from utils.configs import conversation_only
@@ -15,6 +16,7 @@ from utils.configs import conversation_only
 cores = [8, 16, 24, 32]
 timeLayout = "%a %b %d %Y %H:%M:%S"
 
+cache = dc.Cache('./data/pow_config_cache')
 cached_scripts = []
 cached_dpl = ""
 cached_time = 0
@@ -430,14 +432,15 @@ def get_parse_time():
     return now.strftime(timeLayout) + " GMT-0500 (Eastern Standard Time)"
 
 
-def get_config(user_agent):
+@cache.memoize(expire=3600 * 24 * 7)
+def get_config(user_agent, req_token=None):
     config = [
-        random.randint(1080, 1440+1080),
+        random.choice([1920 + 1080, 2560 + 1440, 1920 + 1200, 2560 + 1600]),
         get_parse_time(),
         4294705152,
         0,
         user_agent,
-        "",
+        random.choice(cached_scripts) if cached_scripts else "",
         cached_dpl,
         "en-US",
         "en-US,es-US,en,es",
@@ -445,10 +448,11 @@ def get_config(user_agent):
         random.choice(navigator_key),
         random.choice(document_key),
         random.choice(window_key),
-        time.perf_counter(),
+        time.perf_counter() * 1000,
         str(uuid.uuid4()),
         "",
         random.choice(cores),
+        time.time() * 1000 - (time.perf_counter() * 1000),
     ]
     return config
 
@@ -499,6 +503,6 @@ if __name__ == "__main__":
     #     answer = get_answer_token(seed, diff, config)
     cached_scripts.append(
         "https://cdn.oaistatic.com/_next/static/cXh69klOLzS0Gy2joLDRS/_ssgManifest.js?dpl=453ebaec0d44c2decab71692e1bfe39be35a24b3")
-    cached_dpl = "dpl=453ebaec0d44c2decab71692e1bfe39be35a24b3"
+    cached_dpl = "prod-f501fe933b3edf57aea882da888e1a544df99840"
     config = get_config("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
     get_requirements_token(config)
