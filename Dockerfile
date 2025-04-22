@@ -2,8 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 安装cron服务
-RUN apt-get update && apt-get install -y cron procps
+# 根据不同架构安装相应的依赖
+RUN apt-get update && \
+    apt-get install -y cron procps && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY . /app
 
